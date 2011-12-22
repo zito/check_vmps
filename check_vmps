@@ -1,0 +1,256 @@
+#!/usr/bin/perl
+# vim:si:sts=4:sw=4:
+#
+#        _               _
+#    ___| |__   ___  ___| | __ __   ___ __ ___  _ __  ___
+#   / __| '_ \ / _ \/ __| |/ / \ \ / / '_ ` _ \| '_ \/ __|
+#  | (__| | | |  __/ (__|   <   \ V /| | | | | | |_) \__ \
+#   \___|_| |_|\___|\___|_|\_\___\_/ |_| |_| |_| .__/|___/
+#                           |_____|            |_|
+#
+#
+#   Nagios / Icinga plugin to check VMPS status...
+#
+#   Copyright (C) 2011  Václav Ovsík <vaclav.ovsik@gmail.com>
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#
+#   Based on vqpcli.pl from http://sourceforge.net/projects/vmps/
+#
+
+use strict;
+use warnings;
+use lib '/usr/lib/nagios/plugins';
+use Data::Dumper;
+use Getopt::Long;
+use utils qw(%ERRORS);
+use IO::Socket::INET;
+
+our $VERSION = '1.00';
+
+sub formatItem
+{
+    my ($itemheader, $itemvalue) = @_;
+
+    my $mybuf = pack("H*", $itemheader);	# Add header 
+    my $payload = pack("a*", $itemvalue);
+    my $length = pack("n", length($payload));
+    $mybuf .= $length . $payload;		# Add payload + length
+    return $mybuf;
+}
+
+sub makeVQPrequest
+{
+    my ($req) = @_;
+    my $buf = '';
+
+    # Header...
+    $buf .= pack("H*", "01");		# Header bit
+
+    # Is a request to join a vlan
+    $buf .= pack("H*", "01");		# Is a request
+
+    # No error
+    $buf .= pack("H*", "00");		# No error
+
+    # 6 data items in inbound payload
+    $buf .= pack("H*", "06");
+
+    # Sequence number of request
+    $buf .= pack("H*", "00001234");	# Bogus sequence number
+
+    # Add Client switch IP
+    $buf .= formatItem("00000c01", inet_aton($req->{'client'}));
+
+    # Add Port Name
+    $buf .= formatItem("00000c02", $req->{'port-name'});
+
+    # Add VLAN to confirm to buffer
+    $buf .= formatItem("00000c03", $req->{'vlan'});
+
+    # Add VTP domain name
+    $buf .= formatItem("00000c04", $req->{'vtp-domain'});
+
+    # Add UNKNOWN data to buffer...
+    $buf .= pack("H*", "00000c07");	# Header
+    $buf .= pack("H*", "000100");	# Unknown filler
+
+    # Add MAC address to buffer
+    $buf .= formatItem("00000c06", pack("H*", $req->{'mac-addr'}));
+
+    return $buf;
+}
+
+sub sendVQP
+{
+    my ($req, $buf) = @_;
+    my $srv = $req->{server};
+    my $port = $req->{port};
+
+    my $socket = IO::Socket::INET->new(
+	    PeerHost	=> $srv,
+	    PeerPort	=> $port,
+	    Proto	=> 'udp',
+	    Type	=> SOCK_DGRAM,
+	);
+
+    die "socket(): $!\n" unless $socket;
+
+    $socket->setsockopt(SOL_SOCKET, SO_SNDTIMEO, pack('LL', $req->{timeout}, 0));
+    $socket->setsockopt(SOL_SOCKET, SO_RCVTIMEO, pack('LL', $req->{timeout}, 0));
+
+    $socket->send($buf, 0) == length($buf)
+	    or die "send(): $!\n";
+
+    $socket->recv($buf, 1500, 0)
+	    or die "recv(): $!\n";
+
+    return $buf;
+}
+
+sub parseVQPresp
+{
+    my ($buf) = @_;
+
+    my %res = (
+	status	    => "",
+	vlan	    => "",
+	'mac-addr'  => "",
+    );
+
+    my ($header, $type, $status, $size, $sequence) = unpack("CCCCH8", $buf);
+    $buf = substr($buf, 8);
+
+    $res{status} = $status == 0 ? "ALLOW" :
+	    $status == 3 ? "DENY" :
+	    $status == 4 ? "SHUTDOWN" :
+	    $status == 5 ? "WRONG_DOMAIN" :
+	    "UNKNOWN";
+
+    for(my $i=1; $i <= $size; $i++)
+    {
+	my ($payload_type, $payload_size) = unpack("H8n", $buf);
+	$buf = substr($buf, 6);
+
+	my $payload = substr($buf, 0, $payload_size, '');
+
+	if ( $payload_type eq '00000c03' )
+	{
+	    $res{vlan} = $payload;
+	}
+	elsif ( $payload_type eq '00000c08' )
+	{
+	    $res{'mac-addr'} = unpack("H*", $payload);
+	}
+	else
+	{
+	    $res{"payload_$payload_type"} = $payload;
+	}
+    }
+    return %res;
+}
+
+
+MAIN: {
+    my %opt = (
+	    server	    => '',
+	    port	    => 1589,	    # default protocol port
+	    client  	    => '127.0.0.1', # IP to say we are - VMPS doesn't care
+	    'port-name'	    => 'Fa0/1',	    # Default port name to use
+	    'vtp-domain'    => '',    	    # Is kinda important
+	    vlan    	    => '',	    # Isn't really needed. 
+	    'mac-addr'	    => '',	    # Likewise...
+	    timeout	    => 15,	    # Default 15 sec timeout
+	);
+    usage(1) unless GetOptions(\%opt,
+	    'server|s=s',
+	    'port|p=i',
+	    'client=s',
+	    'port-name|i=s',
+	    'vtp-domain=s',
+	    'vlan=s',
+	    'mac-addr|m=s',
+	    'timeout|t=i',
+	    'version',
+	    'help|h',
+	);
+    usage(0) if defined $opt{'help'};
+
+    if ( $opt{version} )
+    {
+	print "check_vmps v$VERSION\n";
+	print "Copyright (C) 2011 Václav Ovsík <vaclav.ovsik\@gmail.com>\n\n";
+	exit(0);
+    }
+
+    my %req = %opt;
+
+    $req{'server'}
+	    || usage(2, "No Server name specified");
+    $req{'mac-addr'} =~ m/^[[:xdigit:]]{2}(?::[[:xdigit:]]{2}){5}|[[:xdigit:]]{4}(?:\.[[:xdigit:]]{4}){2}$/
+	    || usage(2, 'MAC address must be in nnnn.nnnn.nnnn or nn:nn:nn:nn:nn:nn format');
+#    $req{'vtp-domain'}
+#	    || usage(2, "VTP Domain must be specified");
+    $req{'mac-addr'} = lc($req{'mac-addr'});
+    $req{'mac-addr'} =~ tr{:.}{}d;
+
+    my %res;
+    eval
+    {
+	my $buf = makeVQPrequest(\%req);
+	$buf = sendVQP(\%req, $buf);
+	%res = parseVQPresp($buf);
+    };
+    if ( !$@ )
+    {
+	print "VMPS OK - Vlan: $res{vlan}; MAC Address: $res{'mac-addr'}; Status: $res{status}\n";
+	exit($ERRORS{'OK'});
+    }
+    else
+    {
+	my $msg = "VMPS CRIT - $@";
+	chomp $msg;
+	print $msg, "\n";
+	exit($ERRORS{'CRITICAL'});
+    }
+}
+
+sub usage
+{
+    my $excode = shift;
+    print STDERR "@_\n" if @_;
+    print STDERR <<EOT;
+
+usage: check_vmps -s vmps.server.address -m 12:34:56:78:9a:bc [other options]
+
+Nagios/Icinga plugin to check VMPS status
+
+options:
+ -s, --server server-address	VMPS Server to query
+     --port portno		VMPS port number (defaults to 1589)
+     --client ip-addr		Client switch IP to query for
+ -i, --port-name name		Client switch interface name (defaults to Fa0/1)
+     --vtp-domain domain	VMPS/VTP Domain to query
+     --vlan vlanname		Vlan to reconfirm membership to
+ -m, --mac-addr MAC_address	Attached device MAC address in nnnn.nnnn.nnnn
+				or nn:nn:nn:nn:nn:nn format
+ -t, --timeout value		Timeout in seconds (defaults to 15)
+     --version			Returns plugin version
+ -h, --help			This help usage
+
+EOT
+    exit($excode);
+}
+
