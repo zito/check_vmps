@@ -108,8 +108,8 @@ sub sendVQP
 
     die "socket(): $!\n" unless $socket;
 
-    $socket->setsockopt(SOL_SOCKET, SO_SNDTIMEO, pack('LL', $req->{timeout}, 0));
-    $socket->setsockopt(SOL_SOCKET, SO_RCVTIMEO, pack('LL', $req->{timeout}, 0));
+    $socket->setsockopt(SOL_SOCKET, SO_SNDTIMEO, pack('L!L!', $req->{timeout}, 0));
+    $socket->setsockopt(SOL_SOCKET, SO_RCVTIMEO, pack('L!L!', $req->{timeout}, 0));
 
     $socket->send($buf, 0) == length($buf)
 	    or die "send(): $!\n";
