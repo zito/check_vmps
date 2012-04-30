@@ -38,7 +38,7 @@ use Getopt::Long;
 use utils qw(%ERRORS);
 use IO::Socket::INET;
 
-our $VERSION = '1.00';
+our $VERSION = '1.01';
 
 sub formatItem
 {
