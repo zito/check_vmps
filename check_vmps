@@ -32,13 +32,11 @@
 
 use strict;
 use warnings;
-use lib '/usr/lib/nagios/plugins';
 use Data::Dumper;
 use Getopt::Long;
-use utils qw(%ERRORS);
 use IO::Socket::INET;
 
-our $VERSION = '1.01';
+our $VERSION = '1.02';
 
 sub formatItem
 {
@@ -182,6 +180,8 @@ MAIN: {
 	    'vtp-domain=s',
 	    'vlan=s',
 	    'mac-addr|m=s',
+	    'check-status=s',
+	    'check-vlan=s',
 	    'timeout|t=i',
 	    'version',
 	    'help|h',
@@ -215,15 +215,29 @@ MAIN: {
     };
     if ( !$@ )
     {
-	print "VMPS OK - Vlan: $res{vlan}; MAC Address: $res{'mac-addr'}; Status: $res{status}\n";
-	exit($ERRORS{'OK'});
+	my $stat = 0;
+	my $info = "Vlan: $res{vlan}";
+	if ( $req{'check-vlan'} && lc($res{vlan}) ne lc($req{'check-vlan'}) )
+	{
+	    $stat = 2;
+	    $info .= qq| (!! expected \`$req{'check-vlan'}')|;
+	}
+	$info .= ", MAC Address: $res{'mac-addr'}";
+	$info .= ", Status: $res{status}";
+	if ( $req{'check-status'} && lc($res{status}) ne lc($req{'check-status'}) )
+	{
+	    $stat = 2;
+	    $info .= qq| (!! expected \`$req{'check-status'}')|;
+	}
+	print "VMPS ", ($stat ? 'CRIT' : 'OK'), ' - ', $info, "\n";
+	exit($stat);
     }
     else
     {
 	my $msg = "VMPS CRIT - $@";
 	chomp $msg;
 	print $msg, "\n";
-	exit($ERRORS{'CRITICAL'});
+	exit(2);
     }
 }
 
@@ -246,6 +260,9 @@ options:
      --vlan vlanname		Vlan to reconfirm membership to
  -m, --mac-addr MAC_address	Attached device MAC address in nnnn.nnnn.nnnn
 				or nn:nn:nn:nn:nn:nn format
+     --check-status status	Check expected status in response, status
+				can be ALLOW, DENY, SHUTDOWN, WRONG_DOMAIN
+     --check-vlan vlan		Check expected vlan.
  -t, --timeout value		Timeout in seconds (defaults to 15)
      --version			Returns plugin version
  -h, --help			This help usage
